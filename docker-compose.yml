@@ -1,0 +1,35 @@
+services:
+  mysql:
+    # NOTE: 'latest' currently resolves to MySQL innovation 26.7.0 locally.
+    # Pin a tag (e.g. mysql:9.5) if you want upgrades to be deliberate.
+    image: mysql:latest
+    # fixed name so `docker exec -it mysql mysql ...` keeps working
+    container_name: mysql
+    restart: unless-stopped
+    ports:
+      - "${MYSQL_PORT:-5506}:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD must be set in .env}
+      # schema created on first boot; init scripts below run against it
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-us_stock_monitor_dev}
+    volumes:
+      # named volume: survives `docker compose down`, unlike the old anonymous volume
+      - mysql_data:/var/lib/mysql
+      # imported automatically ONLY when the data volume is empty (first boot)
+      - ./us_stock_monitor_dev.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      # -h 127.0.0.1 matters: the temp server used during init is skip-networking,
+      # so this only goes green once the real server accepts TCP.
+      # NOTE: do NOT use `mysqladmin ping` here. It exits 0 even when the password is
+      # rejected, which makes the check pass while the app cannot authenticate.
+      # A real query is the only thing that fails (exit 1) on bad credentials.
+      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -uroot --password=\"$$MYSQL_ROOT_PASSWORD\" -e 'SELECT 1' >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      # 10 x 5s = ~50s to flag a real problem; init itself only takes a few seconds
+      retries: 10
+      start_period: 30s
+
+volumes:
+  mysql_data:
+    name: mysql_data

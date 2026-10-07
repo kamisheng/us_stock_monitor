@@ -1,0 +1,17 @@
+spring:
+  application:
+    name: stock_mcp
+  profiles:
+    active: dev
+# MyBatisPlus 的配置
+mybatis-plus:
+  global-config:
+    db-config:
+      id-type:
+      update-strategy: not_empty
+
+logging:
+  level:
+    root: info
+    # 排查 MCP 协议交互时打开：
+    # io.modelcontextprotocol: debug
