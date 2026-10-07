@@ -1,0 +1,61 @@
+# ============================================================
+# 配置模板：复制成 application-dev.yaml 后填入真实值
+#   cp application-dev.example.yaml application-dev.yaml
+# application-dev.yaml 已被 .gitignore 忽略，不会提交（里面放真实密码/授权码）
+# ============================================================
+server:
+  port: 7070
+
+spring:
+  application:
+    name: stock_mcp
+
+  # ============ MCP Server ============
+  ai:
+    mcp:
+      server:
+        name: stock-mcp-server
+        version: 1.0.0
+        # 实测：不写 protocol 时默认走 SSE（端点 /sse）；
+        # 要 Streamable HTTP 得显式写 protocol: STREAMABLE（端点 /mcp）
+        sse-endpoint: /sse
+        # 工具方法都是阻塞式的（JDBC / SMTP），建议 SYNC；
+        # ASYNC 模式下阻塞调用有卡住 Netty 事件循环的风险
+        type: SYNC
+
+  # ============ 发信（可选，EmailTool 用）============
+  mail:
+    host: smtp.qq.com
+    port: 465
+    username: YOUR_MAIL@qq.com
+    password: YOUR_SMTP_AUTH_CODE                  # ← QQ 邮箱的「授权码」，不是登录密码
+    protocol: smtp
+    default-encoding: UTF-8
+    properties:
+      mail:
+        smtp:
+          connectiontimeout: 5000                  # 避免 SMTP 卡死阻塞工具调用
+          timeout: 5000
+          writetimeout: 5000
+          socketFactory:
+            port: 465
+            class: javax.net.ssl.SSLSocketFactory
+          ssl:
+            enable: true
+
+  # ============ 数据源（只读查询 us_stock_rss）============
+  datasource:
+    type: com.zaxxer.hikari.HikariDataSource
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://127.0.0.1:5506/us_stock_monitor_dev?useUnicode=true&characterEncoding=UTF-8&autoReconnect=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+    username: root
+    password: YOUR_MYSQL_PASSWORD                  # ← 改成你的库密码
+    hikari:
+      pool-name: DataSourceHikariCP
+      connection-timeout: 30000
+      minimum-idle: 5
+      maximum-pool-size: 20
+      auto-commit: true
+      idle-timeout: 600000
+      max-lifetime: 18000000
+      connection-test-query: SELECT 1

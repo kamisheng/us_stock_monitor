@@ -34,3 +34,8 @@ build/
 
 ### Local env / secrets ###
 .env
+
+### 本地配置：含真实密码 / token / api-key，绝对不要提交 ###
+.env
+**/src/main/resources/application-dev.yaml
+**/src/main/resources/application-local.yaml

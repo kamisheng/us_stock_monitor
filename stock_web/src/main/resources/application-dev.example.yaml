@@ -1,0 +1,80 @@
+# ============================================================
+# 配置模板：复制成 application-dev.yaml 后填入真实值
+#   cp application-dev.example.yaml application-dev.yaml
+# application-dev.yaml 已被 .gitignore 忽略，不会提交（里面放真实密码/密钥）
+# ============================================================
+server:
+  port: 8080
+
+spring:
+  datasource: # 数据源配置（端口与 docker-compose.yml 的 MYSQL_PORT 对应）
+    type: com.zaxxer.hikari.HikariDataSource
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://127.0.0.1:5506/us_stock_monitor_dev?useUnicode=true&characterEncoding=UTF-8&autoReconnect=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+    username: root
+    password: YOUR_MYSQL_PASSWORD                    # ← 改成你的库密码
+    hikari:
+      pool-name: DataSourceHikariCP
+      connection-timeout: 30000
+      minimum-idle: 5
+      maximum-pool-size: 20
+      auto-commit: true
+      idle-timeout: 600000
+      max-lifetime: 18000000
+      connection-test-query: SELECT 1
+
+  # ============ MCP 客户端：连 stock_mcp，把它的工具拿给 ChatClient 用 ============
+  ai:
+    mcp:
+      client:
+        enabled: true
+        type: SYNC
+        # ⚠️ 必须是 false！默认 true 时启动期就强制连 MCP，连不上会让整个应用启动失败
+        #    （实测：BeanCreationException: Error creating bean with name 'mcpSyncClients'）
+        initialized: false
+        # 默认只有 20s，工具执行 + LLM 往返容易被掐
+        request-timeout: 60s
+        # stock_mcp 实际跑的是 SSE 协议（端点是 /sse，不是 /mcp）
+        sse:
+          connections:
+            stock-mcp:
+              url: http://127.0.0.1:7070
+              sse-endpoint: /sse
+        # 默认 true：远程 MCP 工具会自动注册给 ChatClient
+        toolcallback:
+          enabled: true
+
+    # ============ LLM：OpenAI 兼容协议（DeepSeek / OpenRouter / 百炼 都走这里）============
+    openai:
+      base-url: https://api.deepseek.com
+      api-key: YOUR_LLM_API_KEY                      # ← 改成你的 key
+      chat:
+        model: deepseek-chat
+        temperature: 0.3
+      # 换成其它兼容服务只要改 base-url + model，例如：
+      #   OpenRouter: base-url: https://openrouter.ai/api/v1        model: deepseek/deepseek-v3.2
+      #   阿里云百炼:  base-url: https://dashscope.aliyuncs.com/compatible-mode/v1   model: qwen-plus
+
+# MyBatisPlus 配置
+mybatis-plus:
+  global-config:
+    db-config:
+      id-type:
+      update-strategy: not_empty
+  mapper-locations: classpath*:com/kami/stock_web/mapper/xml/*.xml
+
+# ============ Telegram ============
+telegram:
+  enabled: true
+  bot-token: YOUR_BOT_TOKEN                        # ← BotFather 给的 token，形如 123456:AA...
+  # 定时推送的目标群（supergroup），id 是负数、以 -100 开头，必须加引号
+  chat-id: "-1000000000000"
+  # 国内必须走 HTTP 代理，否则连不上 api.telegram.org
+  # （实测不加代理会报 Unable to execute sendmessage method）
+  proxy-host: 127.0.0.1
+  proxy-port: 7897
+  # 私聊白名单：只有这些 Telegram user id 能跟机器人对话
+  # user id 见 https://api.telegram.org/bot<TOKEN>/getUpdates 里的 message.from.id
+  allowed-user-ids: "000000000"
+  # 单轮对话超时（毫秒）
+  chat-timeout-ms: 60000
