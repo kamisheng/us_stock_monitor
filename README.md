@@ -1,298 +1,243 @@
-# 📈 US Stock Monitor — 美股异动监控与 AI 查询
+# 📈 US Stock Monitor
 
-把「美股异动新闻采集 → 落库 → Telegram 推送 → AI 客户端查询」串起来的自托管系统。
-两个 Spring Boot 应用 + 一个 MySQL，全部本地运行，除 Telegram 和大模型 API 外不依赖任何第三方服务。
+> 基于 **Spring Boot 4 + Spring AI 2** 的美股异动监控系统：自动采集美股异动新闻 → 结构化落库 → Telegram 实时推送 → 通过 MCP 协议为 AI 助手提供数据查询能力，并支持在 Telegram 内直接与机器人多轮对话。
 
-## 架构
+一套自托管的全链路系统，除 Telegram 与大模型 API 外不依赖任何第三方服务。
+
+---
+
+## 一、系统架构
 
 ```
                     ┌─────────────────────────────────────────────┐
-                    │  stocktitan.net                             │
-                    │   /rss            (30 req / 300s)           │
-                    │   /news/live.html (10 req / 300s)           │
+                    │  stocktitan.net（数据源）                    │
+                    │   /rss             30 req / 300s            │
+                    │   /news/live.html  10 req / 300s            │
                     └───────────────┬─────────────────────────────┘
-                                    │ 抓取（限流感知 + 5 分钟缓存）
+                                    │ 限流感知抓取 + 本地缓存
 ┌───────────────────────────────────▼──────────────────────────────┐
-│ stock_web   Spring Boot 4.0.8 · Java 21 · :8080                  │
-│   StockScheduler   每 60s 一轮                                    │
-│   RssServiceImpl   抓取 → 解析标签 → 判重 → 批量入库                │
-│   TelegramApi      推送新消息到群                                  │
-│   ServiceLogAspect 慢调用监控                                      │
-└───────────────┬──────────────────────────────┬───────────────────┘
-                │ JDBC                         │ 落库后推送
-        ┌───────▼────────┐              ┌──────▼───────────┐
-        │ MySQL 26.7     │              │ Telegram 群       │
-        │ us_stock_rss   │              └──────────────────┘
-        └───────▲────────┘
-                │ 只读查询
-┌───────────────┴──────────────────────────────────────────────────┐
-│ stock_mcp   Spring Boot 4.1.1 · Spring AI 2.0.1 · :7070          │
-│   MCP Server（SSE 协议，7 个工具）                                 │
+│  stock_web        Spring Boot 4.0.8 · Java 21 · :8080            │
+│                                                                  │
+│   StockScheduler ──► RssServiceImpl ──► 判重 ──► 批量入库         │
+│   (cron 60s)         抓取/解析标签                   │            │
+│                                                                  │
+│   TelegramApi        群组推送（新消息通知）                        │
+│   StockTelegramBot   私聊 AI 对话（白名单鉴权）                    │
+│   ChatService        ChatClient + 会话记忆 + 工具调用             │
+│   ServiceLogAspect   Service 层耗时监控（AOP）                    │
+└───────┬──────────────────────────────┬───────────────────────────┘
+        │ JDBC                         │ Bot API（HTTP 代理）
+┌───────▼────────────┐          ┌──────▼──────────────┐
+│  MySQL 26.7        │          │  Telegram           │
+│  us_stock_rss      │          │  群组 / 私聊         │
+└───────▲────────────┘          └─────────────────────┘
+        │ 只读查询
+┌───────┴──────────────────────────────────────────────────────────┐
+│  stock_mcp        Spring Boot 4.1.1 · Spring AI 2.0.1 · :7070    │
+│                                                                  │
+│   MCP Server（SSE 协议）· 7 个工具                                 │
 │   getStockByCode / getStockByCodeBetweenData /                   │
-│   queryStockBetweenData / sendEmail / getDate / ...              │
-└───────────────▲──────────────────────────────────────────────────┘
-                │ MCP over SSE
-        ┌───────┴────────────────┐
-        │ Cline / Claude Desktop │
-        └────────────────────────┘
+│   queryStockBetweenData / getDate / sendEmail ...                │
+└───────▲──────────────────────────────────────────────────────────┘
+        │ MCP over SSE
+┌───────┴─────────────┐
+│ Cline / Claude 等    │
+└─────────────────────┘
 ```
 
-## 技术栈
+**分层职责**
+
+| 模块 | 定位 | 技术栈 |
+|---|---|---|
+| `stock_web` | 数据采集、定时调度、消息推送、AI 对话入口 | Spring Boot 4.0.8、MyBatis-Plus、AOP、TelegramBots、Spring AI |
+| `stock_mcp` | 数据查询能力输出（MCP Server） | Spring Boot 4.1.1、Spring AI 2.0.1、MCP SDK 2.0 |
+| MySQL | 单一事实来源 | MySQL 26.7.0（Docker） |
+
+---
+
+## 二、核心功能
+
+### 1. 异动新闻自动采集
+- 每 60 秒调度一轮，从数据源拉取**最新 100 条**美股异动新闻
+- 自动解析标题中的股票代码、发布时间（GMT / 北京时间双时区存储）
+- 抓取列表页标签并与新闻**按标题建立映射**，中英文双列存储在库
+
+### 2. 智能标签体系
+- 内置 **31 个标签枚举**（低浮动、低价股、私募、财报盈利、FDA、临床试验…）
+- 英文原文与中文释义**分列存储**（`tags_en` / `tags`），按需取用
+- 未收录标签保留原文，避免数据丢失
+
+### 3. Telegram 实时推送
+- 新消息入库后自动汇总推送到群组，**一轮一条汇总**而非逐条刷屏
+- 内置 HTTP 代理支持，适配受限网络环境
+- 单条消息自动按 Telegram 4096 字符上限截断
+
+### 4. AI 对话（本项目重点）
+在 Telegram 私聊中直接与机器人对话，由大模型自主决定是否调用工具查询真实数据：
+
+```
+用户：12 月异动超过 5 次的股票有哪些？
+机器人：（调用 queryStockBetweenData 工具）→ 2025-12-01 ~ 12-31 异动次数 ≥ 5 的股票共 12 只：
+        SMX(34) SHEL(8) FCPT(7) DEC(6) HKD(6) OWLS(6) CNS(5) DGNX(5) ECDA(5) KKR(5) SIDU(5) TNMG(5)
+```
+
+| 能力 | 实现 |
+|---|---|
+| 多轮对话 | `MessageWindowChatMemory`（窗口 20 条），按会话 ID 隔离上下文 |
+| 工具调用 | Spring AI `ChatClient` + MCP 工具自动挂载，模型自主选择工具与参数 |
+| 权限控制 | 私聊白名单（校验 Telegram **user id**），非白名单用户直接拒绝 |
+| 会话隔离 | 私聊以 `u:{userId}` 为键天然一人一会话；群聊按 `g:{chatId}:u:{userId}` 区分 |
+| 容错降级 | 单条消息处理异常不影响后续消息；MCP 或模型不可用时返回友好提示 |
+| Prompt 约束 | 系统提示词强制要求「股票数据必须调用工具查询，不得凭记忆回答」 |
+
+### 5. MCP 能力输出
+`stock_mcp` 将数据查询能力封装为标准 MCP Server（SSE 协议，7 个工具），
+任何支持 MCP 的 AI 客户端（Cline、Claude Desktop 等）均可直接接入：
+
+```json
+{ "mcpServers": { "stock-mcp": { "url": "http://127.0.0.1:7070/sse" } } }
+```
+
+---
+
+## 三、技术栈
 
 | 组件 | 版本 | 说明 |
 |---|---|---|
-| Spring Boot | **4.0.8**（stock_web）/ **4.1.1**（stock_mcp） | 4.x 的模块化改动踩了不少坑，见下文 |
+| Spring Boot | 4.0.8 / 4.1.1 | 两个应用采用独立版本，验证了跨小版本兼容 |
 | Java | 21 | |
-| MyBatis-Plus | 3.5.17 | 必须用 `mybatis-plus-spring-boot4-starter`；boot3 版依赖 mybatis-spring 3.x，只适配 Spring 6 |
-| MySQL | 26.7.0（docker `mysql:latest`） | 宿主端口 5506 → 容器 3306 |
-| rometools rome | 2.1.0 | RSS 解析 |
-| jsoup | 1.21.2 | 列表页标签抓取 |
-| TelegramBots | 10.3.0 | 10.x 起模块化：`telegrambots-client` / `-longpolling` / `-springboot-longpolling-starter`（老坐标 `org.telegram:telegrambots` 停更在 6.9.7.1） |
-| Spring AI | 2.0.1 | **2.0.x 对应 Boot 4.1.x；1.1.x 及以前只适配 Boot 3.x** |
-| AOP | `spring-boot-starter-aspectj` | Boot 4 里改的名；`spring-boot-starter-aop` 停更在 4.0.0-M2 |
+| Spring AI | 2.0.1 | MCP Server + MCP Client + ChatClient 全套能力 |
+| MCP SDK | 2.0.0 | MCP 协议实现 |
+| MyBatis-Plus | 3.5.17 | 使用 Boot 4 专用 starter |
+| MySQL | 26.7.0 | Docker 部署 |
+| TelegramBots | 10.3.0 | 发送 + 长轮询接收（模块化坐标） |
+| jsoup / rome | 1.21.2 / 2.1.0 | 列表页解析 / RSS 解析 |
+| AOP | `spring-boot-starter-aspectj` | Service 层耗时监控 |
 
-## 快速开始
+> 项目落地过程中主动适配了 Spring Boot 4 的多项破坏性变更（starter 更名与模块化拆分、
+> MyBatis-Plus 与 Spring AI 的版本线切换），并验证了 **Spring AI 2.0.1 在 Spring Boot 4.0.8 上的可用性**。
 
-```bash
-# 1. 数据库：首次启动自动导入 us_stock_monitor_dev.sql（约 2400 行种子数据）
-cp .env.example .env          # 填 MYSQL_ROOT_PASSWORD / MYSQL_DATABASE / MYSQL_PORT
-docker compose up -d
+---
 
-# 2. 配置（含真实密码，已被 gitignore，不会提交）
-cp stock_web/src/main/resources/application-dev.example.yaml \
-   stock_web/src/main/resources/application-dev.yaml     # 填入库密码、Bot Token、LLM Key
-cp stock_mcp/src/main/resources/application-dev.example.yaml \
-   stock_mcp/src/main/resources/application-dev.yaml     # 填入库密码、邮箱授权码
+## 四、工程亮点（实测量化）
 
-# 3. 采集 + 推送
-cd stock_web && ./mvnw spring-boot:run
+| 优化项 | 优化前 | 优化后 | 提升 |
+|---|---|---|---|
+| **单轮外部请求数** | 101 次 | **2 次** | **−98%** |
+| **单轮数据库读行数** | 2,175,300 行 | **302 行** | **约 7200×** |
+| **切面日志量** | 301 条/轮 | **1 条/轮** | **−99.7%** |
+| **标签翻译成功率** | 24/100（76 条为 null） | **36/100（0 条 null）** | 数据质量修复 |
+| **MCP 工具响应** | — | **86 ms / 167 ms** | — |
 
-# 4. MCP 服务（要用 AI 客户端查询时才需要，必须常驻）
-cd stock_mcp && ./mvnw spring-boot:run        # 监听 7070
-```
+**关键设计决策**
 
-> 启动顺序：先 `stock_mcp`（可选），再 `stock_web`。
-> `stock_web` 里的 `spring.ai.mcp.client.initialized` 已置 `false`，MCP 没开也不影响采集推送。
+1. **限流感知采集**：解析服务端 `ratelimit-remaining` / `ratelimit-reset` 响应头做额度守卫，
+   叠加 **5 分钟结果缓存** 与 **60 秒最小重试间隔**，把单轮请求从 100 次压到 1 次，彻底规避 429。
+2. **索引覆盖查询**：为 `(stock_code, pub_date_gmt)` 建立复合索引后，
+   区间聚合查询由全表扫描转为 **覆盖索引扫描**（Covering index range scan），读行数下降 4 个数量级。
+3. **SQL 聚合前置**：将「24 小时 / 3 日 / 1 周」三个窗口的热度统计由 3 次查询合并为
+   **1 次条件聚合**，并配合索引，单轮查询数从 300 次降至 100 次。
+4. **幂等入库**：以业务唯一键 `link` 判重（而非数据库自增主键），
+   配合 `IN` 批量查询 + `saveBatch` 批量写入，实现「重复执行无副作用」。
+5. **可观测性**：通过 AOP 统一记录 Service 层调用耗时并按慢/正常分级输出；
+   精确控制切点范围，避免循环内高频调用污染日志。
+6. **故障隔离**：MCP 客户端采用延迟初始化 + 容错启动，
+   即使 MCP 服务不可用也不影响采集与推送主链路。
 
-## 数据模型
+---
 
-单表 `us_stock_rss`：
+## 五、数据模型
+
+单表 `us_stock_rss`（9 字段 / 2 索引），初始种子数据约 2400 行：
 
 | 列 | 类型 | 说明 |
 |---|---|---|
-| `id` | varchar(64) | 主键，MyBatis-Plus `ASSIGN_ID` 生成的 19 位雪花串 |
+| `id` | varchar(64) | 主键，雪花 ID（19 位） |
 | `stock_code` | varchar(64) | 股票代码 |
-| `title` / `title_zh` | varchar(2550) | 英文标题 / 中文标题 |
-| `link` | varchar(255) | **业务唯一键**，判重依据 |
+| `title` / `title_zh` | varchar(2550) | 英文 / 中文标题 |
+| `link` | varchar(255) | **业务唯一键**，幂等判重依据 |
 | `pub_date_gmt` / `pub_date_bj` | datetime | GMT / 北京时间 |
 | `tags` / `tags_en` | varchar(255) | 中文标签 / 英文原文标签 |
 
 索引：`PRIMARY(id)` + `KEY idx_code_date(stock_code, pub_date_gmt)`
 
-## 核心设计与踩坑记录
+---
 
-### 1. RSS 被服务端强制 gzip，而客户端不会自动解压
+## 六、快速开始
 
-`stocktitan.net` 在客户端**没有**发送 `Accept-Encoding` 的情况下依然返回 `Content-Encoding: gzip`，
-而 `HttpURLConnection` 从不自动解压 → gzip 字节流（`1f 8b`）被当成 XML 解析：
+```bash
+# 1. 启动数据库（首次自动导入建表脚本与种子数据）
+cp .env.example .env          # 填写 MYSQL_ROOT_PASSWORD / MYSQL_DATABASE / MYSQL_PORT
+docker compose up -d
 
+# 2. 生成配置（模板已提交，真实密钥仅存本地且不入库）
+cp stock_web/src/main/resources/application-dev.example.yaml \
+   stock_web/src/main/resources/application-dev.yaml
+cp stock_mcp/src/main/resources/application-dev.example.yaml \
+   stock_mcp/src/main/resources/application-dev.yaml
+
+# 3. 启动 MCP 服务（可选，需常驻）
+cd stock_mcp && ./mvnw spring-boot:run        # :7070
+
+# 4. 启动采集与对话服务
+cd stock_web && ./mvnw spring-boot:run        # :8080
 ```
-ParsingFeedException: Invalid XML: Error on line 1: 前言中不允许有内容
-```
 
-**修复**：自己读 `Content-Encoding` 响应头，命中 gzip 就套 `GZIPInputStream`，再交给 Rome 解析。
+配置项说明（`application-dev.example.yaml` 内含完整注释）：
 
-### 2. 限流：从「第 11 次即封」到分钟级安全
-
-实测服务端给出的限额：
-
-| 端点 | 限额 |
+| 配置 | 用途 |
 |---|---|
-| `/rss` | `ratelimit-policy: 30;w=300`（30 次 / 300 秒） |
-| `/news/live.html` | `ratelimit-policy: 10;w=300`（10 次 / 300 秒） |
+| `spring.datasource.*` | 数据库连接 |
+| `spring.ai.mcp.client.sse.connections` | 连接的 MCP Server 地址 |
+| `spring.ai.openai.base-url / api-key / chat.model` | 大模型接入（OpenAI 兼容协议，DeepSeek / OpenRouter / 百炼均可） |
+| `telegram.bot-token / chat-id` | 机器人凭据与推送群组 |
+| `telegram.allowed-user-ids` | 私聊白名单 |
+| `telegram.proxy-host / proxy-port` | 访问 Telegram API 的 HTTP 代理 |
 
-**原始 bug**：100 条新闻，每条都去抓一次列表页 → **100 次请求**，第 11 次就吃 429。
-**修复后**：一轮只抓 **1 次** 列表页（**100 → 1，降低 99%**），并叠加三层保护：
+**安全实践**：真实密码、Bot Token、API Key 仅存于本地 `application-dev.yaml` 与 `.env`，
+两者均已在 `.gitignore` 中；仓库仅保留 `*.example.yaml` 模板。
 
-- **5 分钟缓存**（与对方 300 秒限流窗口对齐）；
-- **最小重试间隔 60 秒**（失败时缓存不刷新，防止跟着调度频率疯狂重试）；
-- **额度守卫**：读 `ratelimit-remaining` / `ratelimit-reset`，见底就不发请求。
+---
 
-另外实测发现**对方真实限流比宣称的更严**：曾在 `ratelimit-remaining: 7` 时就返回 429。
+## 七、项目结构
 
-### 3. 标签只存在于列表页「最近 50 行」
+```
+us_stock_monitor_dev/
+├── docker-compose.yml                  # MySQL 编排（健康检查 + 初始化脚本挂载）
+├── us_stock_monitor_dev.sql            # 建表 + 种子数据
+├── stock_web/                          # 采集 / 推送 / AI 对话
+│   └── src/main/java/com/kami/stock_web/
+│       ├── StockScheduler.java          # 定时调度（cron 60s）
+│       ├── api/                         # TelegramBot、TelegramApi、MCP 客户端预热
+│       ├── service/                     # 采集、聊天、查询服务
+│       ├── entity/ enums/ mapper/       # 实体、标签枚举、MyBatis-Plus Mapper
+│       ├── aspect/                      # 耗时监控切面
+│       └── utils/                       # RSS 下载、列表页解析、时区转换
+└── stock_mcp/                          # MCP Server（数据查询能力输出）
+    └── src/main/java/com/kami/stock_mcp/
+        ├── tool/                        # MCP 工具定义
+        ├── service/ mapper/ entity/     # 查询层
+        └── aspect/                      # 工具调用日志
+```
 
-列表页只渲染最近 **50 行**，实测覆盖窗口 **5.7 ~ 8.6 小时**；而 RSS 有 **100 条**。统计结果：
+---
 
-| 分类 | 条数 |
+## 八、后续规划
+
+- 抽取 `stock-common` 公共模块，消除两个应用间的重复实体与查询代码
+- 采集侧支持多数据源扩展（当前单一数据源）
+- 为 MCP Server 增加鉴权，支持跨机调用
+- 补齐单元测试与集成测试用例
+
+---
+
+## 附：技术难点摘要
+
+| 难点 | 处理方式 |
 |---|---|
-| 能在列表页找到的 | 49 |
-| 其中真正带标签的 | 36 |
-| 在窗口外（永远拿不到标签） | 51 |
-
-所以约一半 RSS 条目标签为空属**结构性限制**，不是 bug。
-
-### 4. 标签翻译：76/100 为 null → 全部修复
-
-**错误写法**：把多个标签拼成整串，再拿去和枚举里单个 key 做 `equalsIgnoreCase`：
-
-```java
-StockTag.getTagValue(getTagsStr(tags))   // "private placement, penny stock" 永远匹配不上 → null
-```
-
-100 条里 **76 条是 null**（51 条不在页面 + 13 条页面无标签 + 9 条多标签 + 3 条枚举键不匹配）。
-**修复**：逐个 key 翻译再 join，并补上 `dividends`（复数）枚举键 → 未收录标签保留原文，
-**null 归零，36 条正确输出中文**。
-
-### 5. 判重必须用业务键，不能用主键
-
-`id` 是**插入时**才由 MyBatis-Plus 生成的，插入前恒为 null，`getById(null)` 永远返回 null
-→ 结果是每分钟重复插入 100 条。改用 `link` 做业务唯一键 + 一次 `IN` 查询取回已存在的 link，
-再做 `saveBatch(toSave, 500)`。
-
-### 6. MyBatis 的「空行返回 null」陷阱
-
-条件聚合查询 `SUM(...)` 在无匹配行时会返回 **1 行、3 个 NULL**；而 MyBatis 的
-`returnInstanceForEmptyRow` 默认为 `false` —— **整行没有任何列被成功映射时返回的是 null 而不是空对象**
-→ 调用方 NPE。两处修复：
-
-```sql
-SELECT COALESCE(SUM(...), 0) AS counts24Hour, ...   -- ① 别名必须等于实体字段名
-```
-
-```java
-// ② 单参数方法要么用 #{startTime}，要么加 @Param 后才能写 #{dto.startTime}
-List<StockCountsVO> query(@Param("dto") QueryCountsDTO dto);
-```
-
-不加 `@Param` 却写 `#{dto.startTime}` 会抛
-`ReflectionException: There is no getter for property named 'dto'`。
-
-### 7. 索引：读行数从 218 万降到 302
-
-`WHERE stock_code=? AND pub_date_gmt BETWEEN ? AND ?` 原本**只有主键索引**，每次全表扫描。
-100 只股票一轮的实测 `Innodb_rows_read` 增量：
-
-| 方案 | 读行数 / 轮 |
-|---|---|
-| 300 次 count，无索引 | **2,175,300** |
-| 合并成 1 条条件聚合，无索引 | 483,400 |
-| 300 次 count + 索引 | 1,224 |
-| **合并 + 索引（最终方案）** | **302** |
-
-即 **约 7200 倍** 改善，且该查询是 **覆盖索引** 扫描（`Covering index range scan`），无需回表。
-
-### 8. AOP 切点按「方法声明所在类型」匹配
-
-`execution(* com.kami.stock_web.service.*.*(..))` 会切中 `service.impl` 下的实现类 ——
-因为 AspectJ 是按**方法声明所在的类型**匹配，而两个接口正好在 `com.kami.stock_web.service` 包。
-副作用：循环里每条新闻调 3 次的热度统计也被切中，一轮刷 **300 条** 日志。
-排除后 **301 条/轮 → 1 条/轮**。
-
-### 9. Spring Boot 4 的两个改名 + 一个启动期强依赖
-
-| 坑 | 现象 | 解决 |
-|---|---|---|
-| `spring-boot-starter-aop` 没有 GA 版本 | 依赖找不到 | 改用 `spring-boot-starter-aspectj` |
-| MyBatis-Plus boot3 starter 不适配 | 运行期报错 | 改用 `mybatis-plus-spring-boot4-starter` |
-| `spring.ai.mcp.client.initialized` 默认 `true` | **MCP 没开时整个 web 起不来**（`BeanCreationException: mcpSyncClients`） | 置 `false`，由代码自行初始化并 try/catch |
-
-### 10. Telegram 必须显式走 HTTP 代理
-
-不加代理直接发送会报 `Unable to execute sendmessage method`。配置里显式指定
-`telegram.proxy-host/proxy-port`，不依赖系统 TUN，换节点后立即生效。
-
-另外两个细节：**Spring 不读 `.env` 文件**（那是 docker compose 的约定，Spring 只认环境变量 /
-`-D` 参数 / 命令行参数 / `application*.yaml`）；群 id 是负数，写 YAML 时必须加引号
-`chat-id: "-100xxxxxxxxxx"`。
-
-## 实测数字速查
-
-| 指标 | 数值 |
-|---|---|
-| 一轮处理的 RSS 条目 | 100 条 |
-| 一轮实际外部请求数 | 1 次 RSS + 1 次列表页（原先 101 次） |
-| 列表页标签抓取耗时 | 约 0.6 ~ 7 秒（网络波动） |
-| 索引优化后 DB 读行数 | **302 行 / 轮**（原先 2,175,300） |
-| 切面日志 | **1 条 / 轮**（原先 301 条） |
-| 标签翻译 | 36/100 出中文，null **0** 条（原先 76 条 null） |
-| MCP 工具调用延迟 | **86 ms**（getDate）/ **167 ms**（区间聚合查询） |
-| MCP 已注册工具数 | 7 个 |
-| Maven 依赖 | 190 个构件，**0** 版本冲突 |
-
-## MCP Server 用法
-
-服务端**默认走 SSE 协议**（不写 `spring.ai.mcp.server.protocol` 时实测 `/mcp` 返回 404、`/sse` 返回 200）：
-
-| 项 | 值 |
-|---|---|
-| 客户端连接 URL | `http://127.0.0.1:7070/sse` |
-| 消息端点 | `/mcp/message?sessionId=...`（服务端通过 `event:endpoint` 下发，客户端自动使用） |
-| 传输类型 | **SSE (Legacy)** |
-
-Cline / Cherry Studio 配置：
-
-```json
-{ "mcpServers": { "stock-mcp": { "url": "http://127.0.0.1:7070/sse", "timeout": 120 } } }
-```
-
-想换成 Streamable HTTP（端点 `/mcp`）：加 `spring.ai.mcp.server.protocol: STREAMABLE`。
-
-工具的写法（`@Tool` 与 `@McpTool` 都会被扫描注册，无需手写 `ToolCallbackProvider`）：
-
-```java
-@Component
-public class StockTool {
-    @Tool(description = "在起始结束时间内查询股票异动次数大于指定次数的股票，时间为北京时间 yyyy-MM-dd HH:mm:ss")
-    public List<StockCountsVO> queryStockBetweenData(String counts, String startTime, String endTime) {
-        return stockService.queryStockBetweenData(counts, startTime, endTime);
-    }
-}
-```
-
-调用效果（2025-12-01 ~ 2025-12-31，异动次数 ≥ 5）：
-
-```
-SMX(34) SHEL(8) FCPT(7) DEC(6) HKD(6) OWLS(6) CNS(5) DGNX(5) ECDA(5) KKR(5) SIDU(5) TNMG(5)   → 12 只
-（改成严格 "> 5" 则为 6 只 —— 注意 HAVING 用 >= 还是 >）
-```
-
-## Telegram 机器人
-
-| 能力 | 状态 |
-|---|---|
-| 群推送新消息 | ✅ `telegram.chat-id` 配置目标群 |
-| 私聊 AI 对话（LLM + MCP 工具调用） | 🚧 进行中 |
-| 指令式查询（`/count 5 2025-12-01 2025-12-31`） | 🔜 计划中 |
-
-**私聊 vs 群聊**（实测差异）：
-
-| | 群聊 | 私聊 |
-|---|---|---|
-| 收普通消息 | ❌ 隐私模式默认开启（`can_read_all_group_messages=false`），必须 @ 它 | ✅ 全部收到 |
-| `chat.id` | 负数（超级群 `-100` 开头） | 正数（= 用户 id） |
-| 会话隔离 | 全群共用一个 chatId，上下文会串味 | 天然一人一会话 |
-
-**并发说明**：`telegrambots-longpolling:10.3.0` 只提供 `LongPollingSingleThreadUpdateConsumer`，
-其内部是 `Executors.newSingleThreadExecutor(...)` —— **更新是排队串行消费的**，
-一个人的复杂查询会挡住其他人；要并发需自己把业务丢到自定义线程池。
-
-## 已知限制 / Roadmap
-
-- **标签窗口只有约 6 小时**：新闻滑出列表页前 50 行后就永远拿不到标签，约 50% 条目标签为空。
-- **长轮询独占 token**：同一 bot token 不能被两个进程同时 `getUpdates`，否则 409 Conflict。
-- **`stock_mcp` 必须常驻**：独立进程，停了所有工具调用失效（已用 `initialized: false` 保证不影响采集推送）。
-- **两个模块存在重复代码**：`USStockRss`、`StockService`、`StockTitanCrawler`、`GMTDateConverter`
-  等 9 个类两边各一份，计划抽 `stock-common` 公共模块。
-- **MCP 无鉴权**：当前监听所有网卡且无认证，跨机调用前需加鉴权。
-- **`EmailTool` 有越权风险**：接入 LLM 自动决策后模型可能自行发信，需加白名单。
-- 计划：Telegram 私聊 AI 对话（白名单 + `ChatMemory` + MCP 工具）、`stock-common` 公共模块、标签回补任务。
-
-## 安全提示
-
-真实密码 / token / api-key **只放本地**，不要提交：
-
-- `application-dev.yaml` 与 `.env` 已在 `.gitignore` 中；
-- 仓库里只保留 `application-dev.example.yaml` 模板；
-- 已提交过敏感信息的仓库，请务必**轮换凭据**（改密码 / BotFather 撤销 token / 重新生成授权码），
-  因为 Git 历史里的内容无法彻底抹除。
+| 数据源强制 gzip 且客户端不自动解压，导致 XML 解析失败 | 依据 `Content-Encoding` 响应头手动解压后再解析 |
+| 服务端限流严格（10 次 / 300 秒） | 额度感知 + 本地缓存 + 重试节流，请求量降低 98% |
+| 标签仅在列表页最近 50 行内可见 | 明确数据边界，中英文双列存储并保留未收录标签原文 |
+| 全表扫描导致聚合查询缓慢 | 复合索引 + 覆盖索引 + 聚合下推，读行数降低约 7200 倍 |
+| Spring Boot 4 破坏性变更 | 逐个核对 starter 与依赖版本线，完成全套适配 |
+| MCP 服务不可用会阻断应用启动 | 客户端延迟初始化 + 容错启动，实现故障隔离 |
